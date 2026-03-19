@@ -966,11 +966,11 @@ DELETE FROM message_trace WHERE recorded_at < NOW() - INTERVAL '90 days';
 
 ## Summary: Separation of Concerns
 
-| Binary | Talks to Redis | Talks to PostgreSQL | Role |
-|--------|:-:|:-:|------|
-| `openclaw-agent` | ✅ | ❌ | Send/receive messages |
-| `openclaw-orchestrator` | ✅ | ❌ | Route tasks, health checks, DLQ |
-| `openclaw-gateway` | ✅ | ❌ | Auth, rate limit, relay for remote agents |
-| **`openclaw-tracer`** | ✅ (read-only) | ✅ (only writer) | Record everything permanently |
+| Binary | Talks to Redis | Talks to Gateway | Talks to PostgreSQL | Role |
+|--------|:-:|:-:|:-:|------|
+| `openclaw-agent` | ❌ | ✅ (API key) | ❌ | Send/receive messages via gateway |
+| `openclaw-gateway` | ✅ | — | ❌ | Auth, rate limit, relay for agents |
+| `openclaw-orchestrator` | ✅ | ❌ | ❌ | Route tasks, health checks, DLQ |
+| **`openclaw-tracer`** | ✅ (read-only) | ❌ | ✅ (only writer) | Record everything permanently |
 
-The agents and orchestrator remain simple — they only know about Redis. The tracer is a passive, independent observer. If you kill the tracer, messaging continues unaffected. If PostgreSQL goes down, Redis messaging is unaffected. The two systems are fully decoupled.
+Agents never touch Redis directly — they authenticate with the gateway via API key and send/receive messages through its HTTP API. Only infrastructure components (gateway, orchestrator, tracer) have direct Redis access within the VPC. The tracer is a passive, independent observer. If you kill the tracer, messaging continues unaffected. If PostgreSQL goes down, Redis messaging is unaffected. The two systems are fully decoupled.
