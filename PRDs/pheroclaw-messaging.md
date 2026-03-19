@@ -29,71 +29,97 @@ The orchestrator CLI (`clawmacdo`) can't see Telegram conversations. The tracer 
 The `openclaw-agent` binary sits **in front of** each OpenClaw instance as a reverse proxy. ALL traffic — Telegram webhooks, webchat WebSocket, A2A from other agents, orchestrator commands — passes through the sidecar. The sidecar intercepts everything, publishes to Redis, and forwards to the OpenClaw core on localhost.
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         Redis (Shared Bus)                            │
-│                                                                      │
-│  openclaw:orch:broadcast           ← orchestrator fan-out            │
-│  openclaw:agent:{id}:inbox         ← ALL inbound (tasks, P2P, etc.) │
-│  openclaw:agent:{id}:outbox        ← ALL outbound (results, replies)│
-│  openclaw:channel:{id}:{ch}:in     ← human→agent via channel        │
-│  openclaw:channel:{id}:{ch}:out    ← agent→human via channel        │
-│  openclaw:agent:{id}:heartbeat     ← liveness (String + TTL)        │
-│  openclaw:agent:roster             ← Set of known agent IDs         │
-│  openclaw:dlq                      ← dead letter queue              │
-│                                                                      │
-│  Consumer groups: cg-{agent}, cg-tracer, orchestrator                │
-└──────────────────────────────────────────────────────────────────────┘
-     │          │              │                       │
-     ▼          ▼              ▼                       ▼
-┌────────┐ ┌──────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│Tracer  │ │Orch/CLI  │ │  Agent "alpha"        │ │  Agent "beta"         │
-│(Rust)  │ │(Rust)    │ │  (sidecar + OpenClaw) │ │  (sidecar + OpenClaw) │
-│        │ │          │ │                       │ │                       │
-│-passive│ │-broadcast│ │ ┌───────────────────┐ │ │ ┌───────────────────┐ │
-│ reader │ │-send_to  │ │ │ openclaw-agent    │ │ │ │ openclaw-agent    │ │
-│-batch  │ │-DLQ sweep│ │ │ (reverse proxy)   │ │ │ │ (reverse proxy)   │ │
-│ write  │ │-watch cmd│ │ │                   │ │ │ │                   │ │
-│ to PG  │ │-clawmacdo│ │ │ Telegram webhook──┤ │ │ │ Telegram webhook──┤ │
-└───┬────┘ └──────────┘ │ │ Webchat WS/HTTP──┤ │ │ │ Webchat WS/HTTP──┤ │
-    │                   │ │ A2A endpoint─────┤ │ │ │ A2A endpoint─────┤ │
-    ▼                   │ │ Redis inbox──────┤ │ │ │ Redis inbox──────┤ │
-┌────────┐              │ │        │ (all go │ │ │ │        │         │ │
-│Postgres│              │ │        ▼ to Redis│ │ │ │        ▼         │ │
-│(trace) │              │ │ ┌─────────────┐  │ │ │ │ ┌─────────────┐  │ │
-└────────┘              │ │ │OpenClaw Core│  │ │ │ │ │OpenClaw Core│  │ │
-                        │ │ │(AI Agent)   │  │ │ │ │ │(AI Agent)   │  │ │
-                        │ │ │localhost:8080│  │ │ │ │ │localhost:8080│  │ │
-                        │ │ └─────────────┘  │ │ │ │ └─────────────┘  │ │
-                        │ └───────────────────┘ │ │ └───────────────────┘ │
-                        └───────────────────────┘ └───────────────────────┘
-                                ▲          │
-                                │   P2P    │  (sidecar-to-sidecar via
-                                └──────────┘   Redis OR A2A endpoint)
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Infrastructure (VPC / Private Network)                │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                       Redis (Shared Bus)                         │   │
+│  │                                                                  │   │
+│  │  openclaw:orch:broadcast           ← orchestrator fan-out        │   │
+│  │  openclaw:agent:{id}:inbox         ← ALL inbound                 │   │
+│  │  openclaw:agent:{id}:outbox        ← ALL outbound                │   │
+│  │  openclaw:channel:{id}:{ch}:in     ← human→agent via channel     │   │
+│  │  openclaw:channel:{id}:{ch}:out    ← agent→human via channel     │   │
+│  │  openclaw:agent:{id}:heartbeat     ← liveness (String + TTL)     │   │
+│  │  openclaw:agent:roster             ← Set of known agent IDs      │   │
+│  │  openclaw:dlq                      ← dead letter queue           │   │
+│  │                                                                  │   │
+│  │  Consumer groups: cg-{agent}, cg-tracer, orchestrator            │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│       │          │          │                                           │
+│       ▼          ▼          ▼                                           │
+│  ┌────────┐ ┌──────────┐ ┌───────────────────┐                        │
+│  │Tracer  │ │Orch/CLI  │ │  Gateway           │  ← only Redis-facing   │
+│  │(Rust)  │ │(Rust)    │ │  (Rust / HTTP API) │    service exposed to  │
+│  │        │ │          │ │                     │    agents              │
+│  │-passive│ │-broadcast│ │ - API key auth      │                        │
+│  │ reader │ │-send_to  │ │ - rate limiting     │                        │
+│  │-batch  │ │-DLQ sweep│ │ - Redis relay       │                        │
+│  │ write  │ │-watch cmd│ │ - agent registration│                        │
+│  │ to PG  │ │-clawmacdo│ │                     │                        │
+│  └───┬────┘ └──────────┘ └─────────┬───────────┘                        │
+│      │                             │                                    │
+│      ▼                             │ HTTPS (API key auth)               │
+│  ┌────────┐                        │                                    │
+│  │Postgres│                        │                                    │
+│  │(trace) │                        │                                    │
+│  └────────┘                        │                                    │
+└────────────────────────────────────┼────────────────────────────────────┘
+                                     │
+          ┌──────────────────────────┼──────────────────────────┐
+          │                          │                          │
+          ▼                          ▼                          ▼
+┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────┐
+│  Agent "alpha"        │ │  Agent "beta"         │ │  Agent "gamma"    │
+│  (any cloud/region)   │ │  (any cloud/region)   │ │  (any cloud)      │
+│                       │ │                       │ │                   │
+│ ┌───────────────────┐ │ │ ┌───────────────────┐ │ │ ┌───────────────┐ │
+│ │ openclaw-agent    │ │ │ │ openclaw-agent    │ │ │ │ openclaw-agent│ │
+│ │ (reverse proxy)   │ │ │ │ (reverse proxy)   │ │ │ │               │ │
+│ │                   │ │ │ │                   │ │ │ │ Gateway URL + │ │
+│ │ Gateway URL + key─┤ │ │ │ Gateway URL + key─┤ │ │ │ API key ─────┤ │
+│ │ Telegram webhook──┤ │ │ │ Webchat WS/HTTP──┤ │ │ │               │ │
+│ │ Webchat WS/HTTP──┤ │ │ │ A2A endpoint─────┤ │ │ │               │ │
+│ │ A2A endpoint─────┤ │ │ │        │         │ │ │ │        │      │ │
+│ │        │         │ │ │ │        ▼         │ │ │ │        ▼      │ │
+│ │        ▼         │ │ │ │ ┌─────────────┐  │ │ │ │ ┌───────────┐│ │
+│ │ ┌─────────────┐  │ │ │ │ │OpenClaw Core│  │ │ │ │ │OpenClaw   ││ │
+│ │ │OpenClaw Core│  │ │ │ │ │(AI Agent)   │  │ │ │ │ │Core       ││ │
+│ │ │(AI Agent)   │  │ │ │ │ │localhost:8080│  │ │ │ │ │           ││ │
+│ │ │localhost:8080│  │ │ │ │ └─────────────┘  │ │ │ │ └───────────┘│ │
+│ │ └─────────────┘  │ │ │ └───────────────────┘ │ │ └───────────────┘ │
+│ └───────────────────┘ │ └───────────────────────┘ └───────────────────┘
+└───────────────────────┘
 ```
+
+**Key security principle: Agents NEVER connect directly to Redis.** All agent ↔ Redis communication is mediated by the gateway, which authenticates agents via API key and relays messages to/from Redis streams. Only infrastructure components (orchestrator, tracer, gateway) have direct Redis access within the VPC.
 
 **What each component sees:**
 
-| Component | Redis | PostgreSQL | Telegram | Webchat | A2A |
-|-----------|:-----:|:----------:|:--------:|:-------:|:---:|
-| OpenClaw Core | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Agent sidecar** | ✅ R/W | ❌ | ✅ webhook | ✅ proxy | ✅ endpoint |
-| Orchestrator/CLI | ✅ R/W | ❌ | ❌ (reads via Redis) | ❌ (reads via Redis) | ❌ |
-| Tracer | ✅ Read-only | ✅ Sole writer | ❌ | ❌ | ❌ |
+| Component | Redis | Gateway | PostgreSQL | Telegram | Webchat | A2A |
+|-----------|:-----:|:-------:|:----------:|:--------:|:-------:|:---:|
+| OpenClaw Core | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Agent sidecar** | ❌ | ✅ (API key) | ❌ | ✅ webhook | ✅ proxy | ✅ endpoint |
+| **Gateway** | ✅ R/W | — | ❌ | ❌ | ❌ | ❌ |
+| Orchestrator/CLI | ✅ R/W | ❌ | ❌ | ❌ (reads via Redis) | ❌ (reads via Redis) | ❌ |
+| Tracer | ✅ Read-only | ❌ | ✅ Sole writer | ❌ | ❌ | ❌ |
 
-**The OpenClaw core is completely isolated.** It only speaks its native HTTP API on localhost. The sidecar handles all external communication, publishes everything to Redis, and forwards to/from the core. This means:
+**The OpenClaw core is completely isolated.** It only speaks its native HTTP API on localhost. The sidecar handles all external communication, sends messages through the gateway, and forwards to/from the core. This means:
 - `clawmacdo watch --agent alpha --channel telegram` reads from Redis and sees Telegram conversations
 - The tracer records every Telegram message, webchat session, and A2A exchange to PostgreSQL
-- P2P between OpenClaw instances goes sidecar → Redis → sidecar, so it's fully traced
+- P2P between OpenClaw instances goes sidecar → gateway → Redis → gateway → sidecar, so it's fully traced
+- Agents can run anywhere (any cloud, any region) — they only need HTTPS access to the gateway
 
-There are three Rust binaries and one shared library to build:
+There are four Rust binaries and one shared library to build:
 
-1. **`openclaw-agent`** — sidecar reverse proxy that wraps each OpenClaw instance (provisioned via clawmacdo)
-2. **`openclaw-orchestrator`** — central coordinator + CLI (`clawmacdo` integration)
-3. **`openclaw-tracer`** — dedicated consumer that records all messages to PostgreSQL
+1. **`openclaw-agent`** — sidecar reverse proxy that wraps each OpenClaw instance, connects to gateway via API key
+2. **`openclaw-gateway`** — authenticates agents, relays messages to/from Redis (deployed alongside Redis in the VPC)
+3. **`openclaw-orchestrator`** — central coordinator + CLI (`clawmacdo` integration), direct Redis access
+4. **`openclaw-tracer`** — dedicated consumer that records all messages to PostgreSQL, direct Redis access
 
-All three binaries share a common `openclaw-messaging` library crate.
+All four binaries share a common `openclaw-messaging` library crate.
 
-**Separation of concerns:** The OpenClaw core has zero knowledge of Redis, PostgreSQL, or the messaging bus. The agent sidecar bridges all channels into Redis. The tracer passively records everything. The orchestrator/CLI observes and commands via Redis.
+**Separation of concerns:** The OpenClaw core has zero knowledge of Redis, PostgreSQL, or the messaging bus. The agent sidecar bridges all channels through the gateway into Redis. The gateway is the only entry point for agents into the Redis bus. The tracer passively records everything. The orchestrator/CLI observes and commands via Redis.
 
 ---
 
@@ -112,8 +138,9 @@ Replace `Cargo.toml` with a workspace manifest:
 [workspace]
 members = [
     "crates/messaging",      # shared library
-    "crates/orchestrator",   # orchestrator binary
-    "crates/agent",          # agent binary
+    "crates/agent",          # agent binary (connects via gateway)
+    "crates/gateway",        # Redis proxy for agents (API key auth)
+    "crates/orchestrator",   # orchestrator binary (direct Redis)
     "crates/tracer",         # message recorder (PostgreSQL)
 ]
 resolver = "2"
@@ -132,12 +159,13 @@ chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"] }
 ```
 
-### Step 1.2 — Scaffold the four crates
+### Step 1.2 — Scaffold the five crates
 
 ```bash
 mkdir -p crates/messaging/src
-mkdir -p crates/orchestrator/src
 mkdir -p crates/agent/src
+mkdir -p crates/gateway/src
+mkdir -p crates/orchestrator/src
 mkdir -p crates/tracer/src
 mkdir -p crates/tracer/migrations
 ```
@@ -183,7 +211,7 @@ anyhow.workspace = true
 uuid.workspace = true
 ```
 
-**`crates/agent/Cargo.toml`**:
+**`crates/agent/Cargo.toml`** (note: no `fred` — agents connect to Redis through the gateway, never directly):
 ```toml
 [package]
 name = "openclaw-agent"
@@ -197,7 +225,6 @@ path = "src/main.rs"
 [dependencies]
 openclaw-messaging = { path = "../messaging" }
 tokio.workspace = true
-fred.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -210,10 +237,40 @@ chrono.workspace = true
 # Sidecar HTTP server (receives webhooks, webchat, A2A)
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.6", features = ["trace"] }
+
+# HTTP client for gateway + OpenClaw core forwarding
 reqwest = { version = "0.12", features = ["json"] }
 ```
 
-**`crates/tracer/Cargo.toml`** (note: `sqlx` only appears here — agents and orchestrator have zero DB dependencies):
+**`crates/gateway/Cargo.toml`** (deployed alongside Redis in the VPC — the only agent-facing Redis service):
+```toml
+[package]
+name = "openclaw-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+openclaw-messaging = { path = "../messaging" }
+tokio.workspace = true
+fred.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+
+# HTTP server for agent-facing API
+axum = { version = "0.8", features = ["json"] }
+tower-http = { version = "0.6", features = ["trace"] }
+```
+
+**`crates/tracer/Cargo.toml`** (note: `sqlx` only appears here — agents, gateway, and orchestrator have zero DB dependencies):
 ```toml
 [package]
 name = "openclaw-tracer"
