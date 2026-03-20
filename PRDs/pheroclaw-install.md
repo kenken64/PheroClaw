@@ -3,434 +3,392 @@
 # OpenClaw Messaging Stack — Single-Script Installer
 # ═══════════════════════════════════════════════════════════════════
 #
-# Usage:
-#   curl -sSL https://raw.githubusercontent.com/openclaw/messaging/main/install.sh | bash -s -- --role agent --redis-url redis://10.0.0.5:6379
+# Inspired by: k3s (get.k3s.io), Tailscale, Docker (get.docker.com)
 #
-# Roles:
-#   agent        — sidecar reverse proxy + OpenClaw core wrapper
-#   orchestrator — central coordinator + CLI
-#   tracer       — passive message recorder (needs PostgreSQL)
-#   infra        — Redis + PostgreSQL only (no application binaries)
-#   all          — everything on one box (dev/demo)
+# ─── Install (env vars — k3s style) ───
 #
-# The script will:
-#   1. Detect cloud provider, region, instance ID from metadata APIs
-#   2. Generate a unique agent ID: {cloud}-{region}-{short_id}
-#   3. Install dependencies (Redis, PostgreSQL, Rust toolchain as needed)
-#   4. Build or download the binaries
-#   5. Create systemd services
-#   6. Register the instance in Redis with full endpoint metadata
-#   7. Print a summary with connection details
+#   curl -sfL https://get.openclaw.dev | OPENCLAW_ROLE=agent REDIS_URL=redis://10.0.0.5:6379 sh
 #
+# ─── Install (flags) ───
+#
+#   curl -sfL https://get.openclaw.dev | sh -s -- --role agent --redis-url redis://10.0.0.5:6379
+#
+# ─── Uninstall ───
+#
+#   /opt/openclaw/uninstall.sh
+#
+# ─── Roles ───
+#
+#   agent        — sidecar reverse proxy wrapping an OpenClaw instance
+#   orchestrator — central coordinator + clawmacdo CLI
+#   tracer       — passive message recorder → PostgreSQL
+#   infra        — Redis + PostgreSQL only (no app binaries)
+#   all          — everything on one box (dev / demo)
+#
+# ─── Environment variables (all optional, flags override) ───
+#
+#   OPENCLAW_ROLE           Required. One of: agent, orchestrator, tracer, infra, all
+#   REDIS_URL               Redis connection string
+#   DATABASE_URL            PostgreSQL connection string (tracer only)
+#   OPENCLAW_AGENT_ID       Override auto-detected agent ID
+#   OPENCLAW_CORE_URL       OpenClaw AI core address (default: http://127.0.0.1:8080)
+#   OPENCLAW_LISTEN         Sidecar listen address (default: 0.0.0.0:9090)
+#   TELEGRAM_BOT_TOKEN      Telegram bot token (agent only, optional)
+#   OPENCLAW_CHANNEL        GitHub release channel: stable / nightly (default: stable)
+#   OPENCLAW_VERSION        Pin to a specific release tag (e.g. v0.2.1)
+#   OPENCLAW_SKIP_BUILD     Set to "true" to download pre-built binaries
+#
+# ═══════════════════════════════════════════════════════════════════
+
 set -euo pipefail
 
-# ─── Defaults ───
-ROLE=""
-REDIS_URL=""
-DATABASE_URL=""
-OPENCLAW_CORE_URL="http://127.0.0.1:8080"
-SIDECAR_LISTEN="0.0.0.0:9090"
-TELEGRAM_BOT_TOKEN=""
+# ─── Version ───
+INSTALLER_VERSION="0.1.0"
+
+# ─── Defaults (env vars populate these; flags override below) ───
+ROLE="${OPENCLAW_ROLE:-}"
+REDIS_URL="${REDIS_URL:-}"
+DATABASE_URL="${DATABASE_URL:-}"
+AGENT_ID="${OPENCLAW_AGENT_ID:-}"
+CORE_URL="${OPENCLAW_CORE_URL:-http://127.0.0.1:8080}"
+LISTEN="${OPENCLAW_LISTEN:-0.0.0.0:9090}"
+TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+CHANNEL="${OPENCLAW_CHANNEL:-stable}"
+VERSION="${OPENCLAW_VERSION:-latest}"
+SKIP_BUILD="${OPENCLAW_SKIP_BUILD:-false}"
+
+# ─── Fixed paths ───
 INSTALL_DIR="/opt/openclaw"
 BIN_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/openclaw"
 DATA_DIR="/var/lib/openclaw"
-OPENCLAW_USER="openclaw"
-SKIP_BUILD=false
-BINARY_URL=""  # if set, download pre-built binaries instead of compiling
+SVC_USER="openclaw"
+GITHUB_REPO="openclaw/openclaw-messaging-ws"
 
 # ─── Colors ───
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' C='\033[0;36m' B='\033[1m' N='\033[0m'
 
-log()  { echo -e "${GREEN}[openclaw]${NC} $*"; }
-warn() { echo -e "${YELLOW}[openclaw]${NC} $*"; }
-err()  { echo -e "${RED}[openclaw]${NC} $*" >&2; }
-banner() { echo -e "\n${CYAN}═══ $* ═══${NC}\n"; }
+info()  { echo -e "${G}[openclaw]${N} $*"; }
+warn()  { echo -e "${Y}[openclaw]${N} $*"; }
+fatal() { echo -e "${R}[openclaw]${N} $*" >&2; exit 1; }
+banner(){ echo -e "\n${C}═══ $* ═══${N}\n"; }
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 1: Parse arguments
+# Parse flags (override env vars)
 # ═══════════════════════════════════════════════════════════════════
-
-usage() {
-    cat <<EOF
-Usage: $0 --role <role> [options]
-
-Required:
-  --role <role>           One of: agent, orchestrator, tracer, infra, all
-
-Connection (required for agent/orchestrator/tracer):
-  --redis-url <url>       Redis connection URL (e.g. redis://10.0.0.5:6379)
-  --database-url <url>    PostgreSQL URL (required for tracer role)
-
-Agent options:
-  --core-url <url>        OpenClaw core URL (default: http://127.0.0.1:8080)
-  --listen <addr>         Sidecar listen address (default: 0.0.0.0:9090)
-  --telegram-token <tok>  Telegram bot token (optional)
-  --agent-id <id>         Override auto-detected agent ID
-
-Build options:
-  --binary-url <url>      Download pre-built binaries from this URL
-  --skip-build            Skip building from source (requires --binary-url)
-
-EOF
-    exit 1
-}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --role)             ROLE="$2"; shift 2 ;;
+        --role)             ROLE="$2";      shift 2 ;;
         --redis-url)        REDIS_URL="$2"; shift 2 ;;
         --database-url)     DATABASE_URL="$2"; shift 2 ;;
-        --core-url)         OPENCLAW_CORE_URL="$2"; shift 2 ;;
-        --listen)           SIDECAR_LISTEN="$2"; shift 2 ;;
-        --telegram-token)   TELEGRAM_BOT_TOKEN="$2"; shift 2 ;;
-        --agent-id)         OVERRIDE_AGENT_ID="$2"; shift 2 ;;
-        --binary-url)       BINARY_URL="$2"; shift 2 ;;
+        --agent-id)         AGENT_ID="$2";  shift 2 ;;
+        --core-url)         CORE_URL="$2";  shift 2 ;;
+        --listen)           LISTEN="$2";    shift 2 ;;
+        --telegram-token)   TG_TOKEN="$2";  shift 2 ;;
+        --channel)          CHANNEL="$2";   shift 2 ;;
+        --version)          VERSION="$2";   shift 2 ;;
         --skip-build)       SKIP_BUILD=true; shift ;;
-        --help|-h)          usage ;;
-        *)                  err "Unknown option: $1"; usage ;;
+        --help|-h)
+            sed -n '2,/^set -euo/{ /^#/s/^# \?//p }' "$0"
+            exit 0 ;;
+        *) fatal "Unknown flag: $1 (try --help)" ;;
     esac
 done
 
-[[ -z "$ROLE" ]] && { err "--role is required"; usage; }
-[[ "$ROLE" =~ ^(agent|orchestrator|tracer|infra|all)$ ]] || { err "Invalid role: $ROLE"; usage; }
+# ─── Validate ───
+[[ -z "$ROLE" ]] && fatal "OPENCLAW_ROLE or --role is required (agent|orchestrator|tracer|infra|all)"
+[[ "$ROLE" =~ ^(agent|orchestrator|tracer|infra|all)$ ]] || fatal "Invalid role: $ROLE"
 
-# Validate required args per role
-if [[ "$ROLE" == "agent" || "$ROLE" == "orchestrator" ]]; then
-    [[ -z "$REDIS_URL" ]] && { err "--redis-url is required for role=$ROLE"; exit 1; }
-fi
-if [[ "$ROLE" == "tracer" ]]; then
-    [[ -z "$REDIS_URL" ]] && { err "--redis-url is required for role=tracer"; exit 1; }
-    [[ -z "$DATABASE_URL" ]] && { err "--database-url is required for role=tracer"; exit 1; }
-fi
+case "$ROLE" in
+    agent|orchestrator) [[ -z "$REDIS_URL" ]] && fatal "REDIS_URL is required for role=$ROLE" ;;
+    tracer)
+        [[ -z "$REDIS_URL" ]]    && fatal "REDIS_URL is required for role=tracer"
+        [[ -z "$DATABASE_URL" ]] && fatal "DATABASE_URL is required for role=tracer"
+        ;;
+esac
+
+banner "OpenClaw installer v${INSTALLER_VERSION}  •  role=${ROLE}"
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 2: Detect cloud environment + generate agent ID
+# 1. OS check
 # ═══════════════════════════════════════════════════════════════════
 
-banner "Detecting environment"
-
-CLOUD_PROVIDER="bare"
-CLOUD_REGION="local"
-INSTANCE_ID=""
-PUBLIC_IP=""
-PRIVATE_IP=""
-
-# ─── DigitalOcean ───
-detect_digitalocean() {
-    local meta="http://169.254.169.254/metadata/v1"
-    if curl -sf --connect-timeout 2 "$meta/id" > /dev/null 2>&1; then
-        CLOUD_PROVIDER="do"
-        INSTANCE_ID=$(curl -sf "$meta/id")
-        CLOUD_REGION=$(curl -sf "$meta/region")
-        PUBLIC_IP=$(curl -sf "$meta/interfaces/public/0/ipv4/address" 2>/dev/null || echo "")
-        PRIVATE_IP=$(curl -sf "$meta/interfaces/private/0/ipv4/address" 2>/dev/null || echo "")
-        log "DigitalOcean droplet detected: id=$INSTANCE_ID region=$CLOUD_REGION"
-        return 0
-    fi
-    return 1
+verify_os() {
+    [[ "$(uname -s)" != "Linux" ]] && fatal "This installer only supports Linux (detected: $(uname -s))"
+    command -v apt-get &>/dev/null || command -v yum &>/dev/null || fatal "Need apt-get or yum"
+    [[ "$(id -u)" -ne 0 ]] && fatal "Run as root or with sudo"
+    info "OS: $(. /etc/os-release && echo "$PRETTY_NAME") • $(uname -m)"
 }
 
-# ─── AWS / EC2 ───
+verify_os
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. Detect cloud environment
+# ═══════════════════════════════════════════════════════════════════
+
+banner "Detecting cloud environment"
+
+CLOUD="bare"; REGION="local"; INSTANCE_ID=""; PRIVATE_IP=""; PUBLIC_IP=""
+
+detect_do() {
+    local m="http://169.254.169.254/metadata/v1"
+    curl -sf --connect-timeout 2 "$m/id" >/dev/null 2>&1 || return 1
+    CLOUD="do"
+    INSTANCE_ID=$(curl -sf "$m/id")
+    REGION=$(curl -sf "$m/region")
+    PUBLIC_IP=$(curl -sf "$m/interfaces/public/0/ipv4/address" 2>/dev/null || true)
+    PRIVATE_IP=$(curl -sf "$m/interfaces/private/0/ipv4/address" 2>/dev/null || true)
+}
+
 detect_aws() {
-    local token
-    token=$(curl -sf --connect-timeout 2 -X PUT \
+    local tok
+    tok=$(curl -sf --connect-timeout 2 -X PUT \
         -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
-        "http://169.254.169.254/latest/api/token" 2>/dev/null || echo "")
-    if [[ -n "$token" ]]; then
-        CLOUD_PROVIDER="aws"
-        INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $token" \
-            "http://169.254.169.254/latest/meta-data/instance-id")
-        CLOUD_REGION=$(curl -sf -H "X-aws-ec2-metadata-token: $token" \
-            "http://169.254.169.254/latest/meta-data/placement/region")
-        PUBLIC_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $token" \
-            "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || echo "")
-        PRIVATE_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $token" \
-            "http://169.254.169.254/latest/meta-data/local-ipv4" 2>/dev/null || echo "")
-        log "AWS EC2 detected: id=$INSTANCE_ID region=$CLOUD_REGION"
-        return 0
-    fi
-    return 1
+        "http://169.254.169.254/latest/api/token" 2>/dev/null) || return 1
+    [[ -z "$tok" ]] && return 1
+    CLOUD="aws"
+    INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $tok" "http://169.254.169.254/latest/meta-data/instance-id")
+    REGION=$(curl -sf -H "X-aws-ec2-metadata-token: $tok" "http://169.254.169.254/latest/meta-data/placement/region")
+    PUBLIC_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $tok" "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+    PRIVATE_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $tok" "http://169.254.169.254/latest/meta-data/local-ipv4" 2>/dev/null || true)
 }
 
-# ─── Tencent Cloud (CVM) ───
 detect_tencent() {
-    local meta="http://metadata.tencentyun.com/latest/meta-data"
-    if curl -sf --connect-timeout 2 "$meta/instance-id" > /dev/null 2>&1; then
-        CLOUD_PROVIDER="tencent"
-        INSTANCE_ID=$(curl -sf "$meta/instance-id")
-        CLOUD_REGION=$(curl -sf "$meta/placement/zone" | sed 's/-[0-9]*$//')
-        PUBLIC_IP=$(curl -sf "$meta/public-ipv4" 2>/dev/null || echo "")
-        PRIVATE_IP=$(curl -sf "$meta/local-ipv4" 2>/dev/null || echo "")
-        log "Tencent CVM detected: id=$INSTANCE_ID region=$CLOUD_REGION"
-        return 0
-    fi
-    return 1
+    local m="http://metadata.tencentyun.com/latest/meta-data"
+    curl -sf --connect-timeout 2 "$m/instance-id" >/dev/null 2>&1 || return 1
+    CLOUD="tencent"
+    INSTANCE_ID=$(curl -sf "$m/instance-id")
+    REGION=$(curl -sf "$m/placement/zone" | sed 's/-[0-9]*$//')
+    PUBLIC_IP=$(curl -sf "$m/public-ipv4" 2>/dev/null || true)
+    PRIVATE_IP=$(curl -sf "$m/local-ipv4" 2>/dev/null || true)
 }
 
-# ─── BytePlus / Volcengine (ECS) ───
 detect_byteplus() {
-    local meta="http://100.96.0.96/latest/meta-data"
-    if curl -sf --connect-timeout 2 "$meta/instance-id" > /dev/null 2>&1; then
-        CLOUD_PROVIDER="byteplus"
-        INSTANCE_ID=$(curl -sf "$meta/instance-id")
-        CLOUD_REGION=$(curl -sf "$meta/placement/availability-zone" | sed 's/-[a-z]$//')
-        PUBLIC_IP=$(curl -sf "$meta/public-ipv4" 2>/dev/null || echo "")
-        PRIVATE_IP=$(curl -sf "$meta/local-ipv4" 2>/dev/null || echo "")
-        log "BytePlus ECS detected: id=$INSTANCE_ID region=$CLOUD_REGION"
-        return 0
-    fi
-    return 1
+    local m="http://100.96.0.96/latest/meta-data"
+    curl -sf --connect-timeout 2 "$m/instance-id" >/dev/null 2>&1 || return 1
+    CLOUD="byteplus"
+    INSTANCE_ID=$(curl -sf "$m/instance-id")
+    REGION=$(curl -sf "$m/placement/availability-zone" | sed 's/-[a-z]$//')
+    PUBLIC_IP=$(curl -sf "$m/public-ipv4" 2>/dev/null || true)
+    PRIVATE_IP=$(curl -sf "$m/local-ipv4" 2>/dev/null || true)
 }
 
-# ─── GCP ───
 detect_gcp() {
-    if curl -sf --connect-timeout 2 -H "Metadata-Flavor: Google" \
-        "http://metadata.google.internal/computeMetadata/v1/instance/id" > /dev/null 2>&1; then
-        CLOUD_PROVIDER="gcp"
-        INSTANCE_ID=$(curl -sf -H "Metadata-Flavor: Google" \
-            "http://metadata.google.internal/computeMetadata/v1/instance/id")
-        CLOUD_REGION=$(curl -sf -H "Metadata-Flavor: Google" \
-            "http://metadata.google.internal/computeMetadata/v1/instance/zone" | awk -F/ '{print $NF}' | sed 's/-[a-z]$//')
-        PUBLIC_IP=$(curl -sf -H "Metadata-Flavor: Google" \
-            "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null || echo "")
-        PRIVATE_IP=$(curl -sf -H "Metadata-Flavor: Google" \
-            "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip" 2>/dev/null || echo "")
-        log "GCP instance detected: id=$INSTANCE_ID region=$CLOUD_REGION"
-        return 0
-    fi
-    return 1
+    local m="http://metadata.google.internal/computeMetadata/v1"
+    curl -sf --connect-timeout 2 -H "Metadata-Flavor: Google" "$m/instance/id" >/dev/null 2>&1 || return 1
+    CLOUD="gcp"
+    INSTANCE_ID=$(curl -sf -H "Metadata-Flavor: Google" "$m/instance/id")
+    REGION=$(curl -sf -H "Metadata-Flavor: Google" "$m/instance/zone" | awk -F/ '{print $NF}' | sed 's/-[a-z]$//')
+    PUBLIC_IP=$(curl -sf -H "Metadata-Flavor: Google" "$m/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null || true)
+    PRIVATE_IP=$(curl -sf -H "Metadata-Flavor: Google" "$m/instance/network-interfaces/0/ip" 2>/dev/null || true)
 }
 
-# ─── Bare metal / VM fallback ───
 detect_bare() {
-    CLOUD_PROVIDER="bare"
-    CLOUD_REGION="local"
+    CLOUD="bare"; REGION="local"
     INSTANCE_ID=$(hostname -s)
     PRIVATE_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
-    PUBLIC_IP=""
-    log "Bare metal / VM detected: hostname=$INSTANCE_ID ip=$PRIVATE_IP"
 }
 
-# Try each provider in order
-detect_digitalocean || detect_aws || detect_tencent || detect_byteplus || detect_gcp || detect_bare
+detect_do || detect_aws || detect_tencent || detect_byteplus || detect_gcp || detect_bare
 
-# ─── Generate agent ID ───
-if [[ -n "${OVERRIDE_AGENT_ID:-}" ]]; then
-    AGENT_ID="$OVERRIDE_AGENT_ID"
-    log "Using override agent ID: $AGENT_ID"
-else
-    # Format: {cloud}-{region}-{short_instance_id}
-    # Truncate instance ID to 8 chars for readability
+# Generate agent ID if not overridden
+if [[ -z "$AGENT_ID" ]]; then
     SHORT_ID=$(echo "$INSTANCE_ID" | tail -c 9 | tr -d '\n')
-    AGENT_ID="${CLOUD_PROVIDER}-${CLOUD_REGION}-${SHORT_ID}"
-    log "Generated agent ID: $AGENT_ID"
+    AGENT_ID="${CLOUD}-${REGION}-${SHORT_ID}"
 fi
 
-# Determine the best reachable IP (prefer private for VPC, fall back to public)
 ENDPOINT_IP="${PRIVATE_IP:-${PUBLIC_IP:-127.0.0.1}}"
-SIDECAR_PORT=$(echo "$SIDECAR_LISTEN" | grep -oP ':\K[0-9]+$' || echo "9090")
+SIDECAR_PORT=$(echo "$LISTEN" | grep -oP ':\K[0-9]+$' || echo "9090")
 AGENT_ENDPOINT="http://${ENDPOINT_IP}:${SIDECAR_PORT}"
 
-log "Agent ID:       $AGENT_ID"
-log "Cloud:          $CLOUD_PROVIDER"
-log "Region:         $CLOUD_REGION"
-log "Instance ID:    $INSTANCE_ID"
-log "Private IP:     ${PRIVATE_IP:-n/a}"
-log "Public IP:      ${PUBLIC_IP:-n/a}"
-log "Endpoint:       $AGENT_ENDPOINT"
+info "Agent ID:    ${B}${AGENT_ID}${N}"
+info "Cloud:       $CLOUD / $REGION"
+info "Instance:    $INSTANCE_ID"
+info "IPs:         private=${PRIVATE_IP:-n/a}  public=${PUBLIC_IP:-n/a}"
+info "Endpoint:    $AGENT_ENDPOINT"
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 3: Install system dependencies
+# 3. Install system dependencies (idempotent)
 # ═══════════════════════════════════════════════════════════════════
 
 banner "Installing dependencies"
 
 export DEBIAN_FRONTEND=noninteractive
 
-install_base() {
-    apt-get update -qq
-    apt-get install -y -qq curl wget jq build-essential pkg-config libssl-dev > /dev/null
-    log "Base packages installed"
+pkg_install() {
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq && apt-get install -y -qq "$@" >/dev/null
+    elif command -v yum &>/dev/null; then
+        yum install -y -q "$@" >/dev/null
+    fi
+}
+
+ensure_user() {
+    id "$SVC_USER" &>/dev/null && return
+    useradd --system --shell /bin/false --home-dir "$DATA_DIR" --create-home "$SVC_USER"
+    info "Created system user: $SVC_USER"
+}
+
+ensure_dirs() {
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" "$BIN_DIR"
+    chown "$SVC_USER:$SVC_USER" "$DATA_DIR"
 }
 
 install_redis() {
-    if command -v redis-server &>/dev/null; then
-        log "Redis already installed: $(redis-server --version | head -1)"
-        return
-    fi
-    apt-get install -y -qq redis-server > /dev/null
-    # Bind to all interfaces for VPC access
-    sed -i 's/^bind 127.0.0.1/bind 0.0.0.0/' /etc/redis/redis.conf
-    sed -i 's/^# maxmemory <bytes>/maxmemory 256mb/' /etc/redis/redis.conf
-    echo "maxmemory-policy allkeys-lru" >> /etc/redis/redis.conf
-    # Enable AOF persistence
-    sed -i 's/^appendonly no/appendonly yes/' /etc/redis/redis.conf
-    systemctl enable redis-server
-    systemctl restart redis-server
-    log "Redis installed and configured"
+    command -v redis-server &>/dev/null && { info "Redis: $(redis-server --version | head -1)"; return; }
+    pkg_install redis-server
+    local conf="/etc/redis/redis.conf"
+    [[ -f "$conf" ]] && {
+        sed -i 's/^bind 127.0.0.1.*/bind 0.0.0.0/' "$conf"
+        sed -i 's/^appendonly no/appendonly yes/' "$conf"
+        grep -q '^maxmemory ' "$conf" || echo "maxmemory 256mb" >> "$conf"
+        grep -q '^maxmemory-policy ' "$conf" || echo "maxmemory-policy allkeys-lru" >> "$conf"
+    }
+    systemctl enable --now redis-server
+    info "Redis installed"
 }
 
 install_postgres() {
-    if command -v psql &>/dev/null; then
-        log "PostgreSQL already installed: $(psql --version)"
-        return
-    fi
-    apt-get install -y -qq postgresql postgresql-client > /dev/null
-    systemctl enable postgresql
-    systemctl start postgresql
-
-    # Create database and user for the tracer
-    sudo -u postgres psql -c "CREATE USER openclaw_tracer WITH PASSWORD 'openclaw_tracer';" 2>/dev/null || true
-    sudo -u postgres psql -c "CREATE DATABASE openclaw_trace OWNER openclaw_tracer;" 2>/dev/null || true
-    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE openclaw_trace TO openclaw_tracer;" 2>/dev/null || true
-
-    # Allow connections from VPC
-    local pg_hba
-    pg_hba=$(find /etc/postgresql -name pg_hba.conf | head -1)
-    if [[ -n "$pg_hba" ]]; then
-        echo "host openclaw_trace openclaw_tracer 0.0.0.0/0 md5" >> "$pg_hba"
-        # Allow listening on all interfaces
-        local pg_conf
-        pg_conf=$(find /etc/postgresql -name postgresql.conf | head -1)
-        sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" "$pg_conf"
+    command -v psql &>/dev/null && { info "PostgreSQL: $(psql --version)"; return; }
+    pkg_install postgresql postgresql-client
+    systemctl enable --now postgresql
+    sudo -u postgres psql -c "SELECT 1 FROM pg_roles WHERE rolname='openclaw_tracer'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE USER openclaw_tracer WITH PASSWORD 'openclaw_tracer';"
+    sudo -u postgres psql -lqt | cut -d\| -f1 | grep -qw openclaw_trace || \
+        sudo -u postgres psql -c "CREATE DATABASE openclaw_trace OWNER openclaw_tracer;"
+    local hba; hba=$(find /etc/postgresql -name pg_hba.conf 2>/dev/null | head -1)
+    [[ -n "$hba" ]] && {
+        grep -q openclaw_tracer "$hba" || echo "host openclaw_trace openclaw_tracer 0.0.0.0/0 md5" >> "$hba"
+        local pgconf; pgconf=$(find /etc/postgresql -name postgresql.conf | head -1)
+        sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" "$pgconf"
         systemctl restart postgresql
-    fi
-
-    log "PostgreSQL installed and configured"
-    if [[ -z "$DATABASE_URL" ]]; then
-        DATABASE_URL="postgres://openclaw_tracer:openclaw_tracer@127.0.0.1:5432/openclaw_trace"
-        log "DATABASE_URL set to: $DATABASE_URL"
-    fi
+    }
+    info "PostgreSQL installed"
+    [[ -z "$DATABASE_URL" ]] && DATABASE_URL="postgres://openclaw_tracer:openclaw_tracer@127.0.0.1:5432/openclaw_trace"
 }
 
 install_rust() {
-    if command -v cargo &>/dev/null; then
-        log "Rust already installed: $(rustc --version)"
-        return
-    fi
+    command -v cargo &>/dev/null && { info "Rust: $(rustc --version)"; return; }
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
     source "$HOME/.cargo/env"
-    log "Rust installed: $(rustc --version)"
+    info "Rust: $(rustc --version)"
 }
 
-# Create openclaw system user
-create_user() {
-    if id "$OPENCLAW_USER" &>/dev/null; then
-        log "User $OPENCLAW_USER already exists"
-        return
-    fi
-    useradd --system --shell /bin/false --home-dir "$DATA_DIR" --create-home "$OPENCLAW_USER"
-    log "Created system user: $OPENCLAW_USER"
-}
-
-install_base
-create_user
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" "$BIN_DIR"
+pkg_install curl wget jq openssl
+ensure_user
+ensure_dirs
 
 case "$ROLE" in
-    infra)
-        install_redis
-        install_postgres
-        ;;
-    agent|orchestrator)
-        install_rust
-        ;;
-    tracer)
-        install_rust
-        ;;
+    infra)              install_redis; install_postgres ;;
+    agent|orchestrator) install_rust ;;
+    tracer)             install_rust ;;
     all)
-        install_redis
-        install_postgres
-        install_rust
+        install_redis; install_postgres; install_rust
         REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}"
         DATABASE_URL="${DATABASE_URL:-postgres://openclaw_tracer:openclaw_tracer@127.0.0.1:5432/openclaw_trace}"
         ;;
 esac
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 4: Build or download binaries
+# 4. Build or download binaries
 # ═══════════════════════════════════════════════════════════════════
 
-if [[ "$ROLE" != "infra" ]]; then
-    banner "Building binaries"
+needs_binary() { [[ "$ROLE" != "infra" ]]; }
 
-    if [[ "$SKIP_BUILD" == true && -n "$BINARY_URL" ]]; then
-        log "Downloading pre-built binaries from $BINARY_URL"
-        cd /tmp
-        wget -q "$BINARY_URL" -O openclaw-binaries.tar.gz
-        tar xzf openclaw-binaries.tar.gz -C "$BIN_DIR"
-        rm -f openclaw-binaries.tar.gz
+download_binaries() {
+    local arch; arch=$(uname -m)
+    case "$arch" in x86_64) arch="x86_64" ;; aarch64) arch="aarch64" ;; *) fatal "Unsupported arch: $arch" ;; esac
+
+    local tag="$VERSION"
+    if [[ "$tag" == "latest" ]]; then
+        tag=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r .tag_name)
+        [[ -z "$tag" || "$tag" == "null" ]] && fatal "Cannot determine latest release"
+    fi
+
+    local url="https://github.com/${GITHUB_REPO}/releases/download/${tag}/openclaw-${arch}-linux.tar.gz"
+    local checksum_url="${url}.sha256"
+
+    info "Downloading $tag for $arch..."
+    local tmp; tmp=$(mktemp -d)
+    curl -sfL "$url" -o "$tmp/openclaw.tar.gz" || fatal "Download failed: $url"
+
+    # Verify SHA256 checksum if available
+    if curl -sfL "$checksum_url" -o "$tmp/SHA256SUMS" 2>/dev/null; then
+        (cd "$tmp" && sha256sum -c SHA256SUMS) || fatal "Checksum verification failed!"
+        info "SHA256 checksum verified ✓"
     else
-        # Clone and build from source
-        cd "$INSTALL_DIR"
-        if [[ ! -d "openclaw-messaging-ws" ]]; then
-            log "Cloning repository..."
-            git clone https://github.com/openclaw/openclaw-messaging-ws.git 2>/dev/null || {
-                warn "Git clone failed — initialising workspace from scratch"
-                mkdir -p openclaw-messaging-ws
-            }
-        fi
-        cd openclaw-messaging-ws
+        warn "No checksum file — skipping verification"
+    fi
 
-        log "Building workspace (release mode)..."
-        source "$HOME/.cargo/env" 2>/dev/null || true
+    tar xzf "$tmp/openclaw.tar.gz" -C "$BIN_DIR"
+    rm -rf "$tmp"
+    info "Binaries installed from release $tag"
+}
 
-        case "$ROLE" in
-            agent)
-                cargo build --release -p openclaw-agent 2>&1 | tail -5
-                cp target/release/agent "$BIN_DIR/openclaw-agent"
-                ;;
-            orchestrator)
-                cargo build --release -p openclaw-orchestrator 2>&1 | tail -5
-                cp target/release/orchestrator "$BIN_DIR/openclaw-orchestrator"
-                ;;
-            tracer)
-                cargo build --release -p openclaw-tracer 2>&1 | tail -5
-                cp target/release/tracer "$BIN_DIR/openclaw-tracer"
-                ;;
-            all)
-                cargo build --release 2>&1 | tail -5
-                cp target/release/agent "$BIN_DIR/openclaw-agent"
-                cp target/release/orchestrator "$BIN_DIR/openclaw-orchestrator"
-                cp target/release/tracer "$BIN_DIR/openclaw-tracer"
-                ;;
-        esac
+build_binaries() {
+    source "$HOME/.cargo/env" 2>/dev/null || true
+    cd "$INSTALL_DIR"
 
-        log "Binaries installed to $BIN_DIR"
+    if [[ ! -d "openclaw-messaging-ws" ]]; then
+        info "Cloning repository..."
+        git clone "https://github.com/${GITHUB_REPO}.git" openclaw-messaging-ws 2>/dev/null || {
+            warn "Clone failed — initialise the workspace manually"; return 1
+        }
+    else
+        info "Updating repository..."
+        (cd openclaw-messaging-ws && git pull --ff-only 2>/dev/null || true)
+    fi
+
+    cd openclaw-messaging-ws
+    info "Building (release)... this may take a few minutes"
+
+    case "$ROLE" in
+        agent)        cargo build --release -p openclaw-agent        2>&1 | tail -3 ;;
+        orchestrator) cargo build --release -p openclaw-orchestrator 2>&1 | tail -3 ;;
+        tracer)       cargo build --release -p openclaw-tracer       2>&1 | tail -3 ;;
+        all)          cargo build --release                          2>&1 | tail -3 ;;
+    esac
+
+    local t="target/release"
+    [[ "$ROLE" == "agent"        || "$ROLE" == "all" ]] && cp "$t/agent"        "$BIN_DIR/openclaw-agent"
+    [[ "$ROLE" == "orchestrator" || "$ROLE" == "all" ]] && cp "$t/orchestrator" "$BIN_DIR/openclaw-orchestrator"
+    [[ "$ROLE" == "tracer"       || "$ROLE" == "all" ]] && cp "$t/tracer"       "$BIN_DIR/openclaw-tracer"
+
+    info "Build complete"
+}
+
+if needs_binary; then
+    banner "Installing binaries"
+    if [[ "$SKIP_BUILD" == "true" ]]; then
+        download_binaries
+    else
+        pkg_install build-essential pkg-config libssl-dev git
+        build_binaries
     fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 5: Generate config + API key
+# 5. Write config
 # ═══════════════════════════════════════════════════════════════════
 
-banner "Generating configuration"
+banner "Writing configuration"
 
-# Generate a random API key for gateway auth
 API_KEY=$(openssl rand -hex 32)
 
 cat > "$CONFIG_DIR/openclaw.env" <<EOF
-# ═══ OpenClaw Messaging Configuration ═══
-# Generated by install.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-# Role: $ROLE
-# Agent ID: $AGENT_ID
-
+# OpenClaw — generated $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# Role: $ROLE | Agent: $AGENT_ID
 OPENCLAW_AGENT_ID=$AGENT_ID
+OPENCLAW_ROLE=$ROLE
 REDIS_URL=$REDIS_URL
 DATABASE_URL=$DATABASE_URL
-OPENCLAW_CORE_URL=$OPENCLAW_CORE_URL
-SIDECAR_LISTEN=$SIDECAR_LISTEN
-TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+OPENCLAW_CORE_URL=$CORE_URL
+SIDECAR_LISTEN=$LISTEN
+TELEGRAM_BOT_TOKEN=$TG_TOKEN
 GATEWAY_API_KEY=$API_KEY
-
-# Cloud metadata (auto-detected)
-OPENCLAW_CLOUD=$CLOUD_PROVIDER
-OPENCLAW_REGION=$CLOUD_REGION
+OPENCLAW_CLOUD=$CLOUD
+OPENCLAW_REGION=$REGION
 OPENCLAW_INSTANCE_ID=$INSTANCE_ID
 OPENCLAW_ENDPOINT=$AGENT_ENDPOINT
 OPENCLAW_PRIVATE_IP=${PRIVATE_IP:-}
@@ -438,286 +396,195 @@ OPENCLAW_PUBLIC_IP=${PUBLIC_IP:-}
 EOF
 
 chmod 600 "$CONFIG_DIR/openclaw.env"
-chown "$OPENCLAW_USER:$OPENCLAW_USER" "$CONFIG_DIR/openclaw.env"
-log "Config written to $CONFIG_DIR/openclaw.env"
+chown "$SVC_USER:$SVC_USER" "$CONFIG_DIR/openclaw.env"
+info "Config: $CONFIG_DIR/openclaw.env"
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 6: Register in Redis (agent discovery)
+# 6. Register in Redis (agent auto-discovery)
 # ═══════════════════════════════════════════════════════════════════
 
-register_in_redis() {
-    banner "Registering with Redis"
+register_redis() {
+    [[ -z "$REDIS_URL" ]] && return
 
-    # Wait for Redis to be reachable
-    local redis_host redis_port
-    redis_host=$(echo "$REDIS_URL" | sed -E 's|redis://([^:]+):([0-9]+).*|\1|')
-    redis_port=$(echo "$REDIS_URL" | sed -E 's|redis://([^:]+):([0-9]+).*|\2|')
+    command -v redis-cli &>/dev/null || pkg_install redis-tools 2>/dev/null || true
+    command -v redis-cli &>/dev/null || { warn "redis-cli not available — agent will self-register on startup"; return; }
 
-    local retries=10
-    while ! redis-cli -h "$redis_host" -p "$redis_port" PING &>/dev/null; do
+    local host port
+    host=$(echo "$REDIS_URL" | sed -E 's|redis[s]?://([^:@]+@)?([^:]+):([0-9]+).*|\2|')
+    port=$(echo "$REDIS_URL" | sed -E 's|redis[s]?://([^:@]+@)?([^:]+):([0-9]+).*|\3|')
+
+    local retries=5
+    while ! redis-cli -h "$host" -p "$port" PING &>/dev/null; do
         retries=$((retries - 1))
-        if [[ $retries -le 0 ]]; then
-            warn "Cannot reach Redis at $REDIS_URL — skipping registration"
-            warn "The agent will self-register on first startup"
-            return
-        fi
-        log "Waiting for Redis... ($retries attempts left)"
+        [[ $retries -le 0 ]] && { warn "Cannot reach Redis — agent will self-register on startup"; return; }
         sleep 2
     done
 
-    # ─── Add to roster (Set) ───
-    redis-cli -h "$redis_host" -p "$redis_port" \
-        SADD "openclaw:agent:roster" "$AGENT_ID" > /dev/null
-    log "Added $AGENT_ID to roster"
+    # Roster Set
+    redis-cli -h "$host" -p "$port" SADD "openclaw:agent:roster" "$AGENT_ID" >/dev/null
 
-    # ─── Write agent metadata (Hash) ───
-    # This is the discovery record. The orchestrator reads this to know
-    # how to reach each agent (endpoint URL, cloud, region, etc.)
-    redis-cli -h "$redis_host" -p "$redis_port" HSET "openclaw:agent:${AGENT_ID}:meta" \
-        "agent_id"      "$AGENT_ID" \
-        "role"          "$ROLE" \
-        "cloud"         "$CLOUD_PROVIDER" \
-        "region"        "$CLOUD_REGION" \
-        "instance_id"   "$INSTANCE_ID" \
-        "endpoint"      "$AGENT_ENDPOINT" \
-        "private_ip"    "${PRIVATE_IP:-}" \
-        "public_ip"     "${PUBLIC_IP:-}" \
-        "sidecar_port"  "$SIDECAR_PORT" \
-        "hostname"      "$(hostname -f 2>/dev/null || hostname)" \
-        "os"            "$(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')" \
-        "installed_at"  "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-        "version"       "0.1.0" \
-        > /dev/null
-    log "Written discovery metadata to openclaw:agent:${AGENT_ID}:meta"
+    # Metadata Hash — this is the discovery record the orchestrator reads
+    redis-cli -h "$host" -p "$port" HSET "openclaw:agent:${AGENT_ID}:meta" \
+        agent_id     "$AGENT_ID" \
+        role         "$ROLE" \
+        cloud        "$CLOUD" \
+        region       "$REGION" \
+        instance_id  "$INSTANCE_ID" \
+        endpoint     "$AGENT_ENDPOINT" \
+        private_ip   "${PRIVATE_IP:-}" \
+        public_ip    "${PUBLIC_IP:-}" \
+        hostname     "$(hostname -f 2>/dev/null || hostname)" \
+        version      "$INSTALLER_VERSION" \
+        installed_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        >/dev/null
 
-    # ─── Verify registration ───
-    local count
-    count=$(redis-cli -h "$redis_host" -p "$redis_port" SCARD "openclaw:agent:roster")
-    log "Roster now has $count registered agent(s)"
-
-    # Show all registered agents
-    log "Current roster:"
-    redis-cli -h "$redis_host" -p "$redis_port" SMEMBERS "openclaw:agent:roster" | while read -r id; do
-        local ep
-        ep=$(redis-cli -h "$redis_host" -p "$redis_port" HGET "openclaw:agent:${id}:meta" "endpoint")
-        local cloud
-        cloud=$(redis-cli -h "$redis_host" -p "$redis_port" HGET "openclaw:agent:${id}:meta" "cloud")
-        local region
-        region=$(redis-cli -h "$redis_host" -p "$redis_port" HGET "openclaw:agent:${id}:meta" "region")
-        echo "  ${id} → ${ep} (${cloud}/${region})"
-    done
+    local count; count=$(redis-cli -h "$host" -p "$port" SCARD "openclaw:agent:roster")
+    info "Registered in Redis (${count} agent(s) in roster)"
 }
 
-# Install redis-cli if needed (for registration even if this isn't the Redis host)
-if ! command -v redis-cli &>/dev/null; then
-    apt-get install -y -qq redis-tools > /dev/null 2>&1 || true
-fi
-
-if [[ -n "$REDIS_URL" ]]; then
-    register_in_redis
-fi
+banner "Registering"
+register_redis
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 7: Create systemd services
+# 7. Create systemd services
 # ═══════════════════════════════════════════════════════════════════
 
 banner "Creating systemd services"
 
-create_agent_service() {
-    cat > /etc/systemd/system/openclaw-agent.service <<EOF
+create_service() {
+    local name="$1" desc="$2" bin="$3"
+    cat > "/etc/systemd/system/openclaw-${name}.service" <<UNIT
 [Unit]
-Description=OpenClaw Agent Sidecar ($AGENT_ID)
-After=network.target
+Description=OpenClaw ${desc} (${AGENT_ID})
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=$OPENCLAW_USER
+User=$SVC_USER
 EnvironmentFile=$CONFIG_DIR/openclaw.env
-ExecStart=$BIN_DIR/openclaw-agent
+ExecStart=${BIN_DIR}/${bin}
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=openclaw-agent
-
-# Hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$DATA_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable openclaw-agent
-    log "Created openclaw-agent.service"
-}
-
-create_orchestrator_service() {
-    cat > /etc/systemd/system/openclaw-orchestrator.service <<EOF
-[Unit]
-Description=OpenClaw Orchestrator
-After=network.target
-
-[Service]
-Type=simple
-User=$OPENCLAW_USER
-EnvironmentFile=$CONFIG_DIR/openclaw.env
-ExecStart=$BIN_DIR/openclaw-orchestrator
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=openclaw-orch
+SyslogIdentifier=openclaw-${name}
 
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+PrivateTmp=true
 ReadWritePaths=$DATA_DIR
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
     systemctl daemon-reload
-    systemctl enable openclaw-orchestrator
-    log "Created openclaw-orchestrator.service"
-}
-
-create_tracer_service() {
-    cat > /etc/systemd/system/openclaw-tracer.service <<EOF
-[Unit]
-Description=OpenClaw Message Tracer
-After=network.target postgresql.service
-
-[Service]
-Type=simple
-User=$OPENCLAW_USER
-EnvironmentFile=$CONFIG_DIR/openclaw.env
-ExecStart=$BIN_DIR/openclaw-tracer
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=openclaw-tracer
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$DATA_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable openclaw-tracer
-    log "Created openclaw-tracer.service"
+    systemctl enable "openclaw-${name}" >/dev/null
+    info "Created openclaw-${name}.service"
 }
 
 case "$ROLE" in
-    agent)        create_agent_service ;;
-    orchestrator) create_orchestrator_service ;;
-    tracer)       create_tracer_service ;;
+    agent)        create_service agent        "Agent Sidecar"  openclaw-agent ;;
+    orchestrator) create_service orchestrator "Orchestrator"   openclaw-orchestrator ;;
+    tracer)       create_service tracer       "Tracer"         openclaw-tracer ;;
     all)
-        create_agent_service
-        create_orchestrator_service
-        create_tracer_service
+        create_service agent        "Agent Sidecar"  openclaw-agent
+        create_service orchestrator "Orchestrator"   openclaw-orchestrator
+        create_service tracer       "Tracer"         openclaw-tracer
         ;;
 esac
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 8: Start services
+# 8. Generate uninstall script
+# ═══════════════════════════════════════════════════════════════════
+
+cat > "$INSTALL_DIR/uninstall.sh" <<'UNINSTALL'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "[openclaw] Stopping and removing services..."
+for svc in openclaw-agent openclaw-orchestrator openclaw-tracer; do
+    systemctl stop "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${svc}.service"
+done
+systemctl daemon-reload
+
+echo "[openclaw] Removing binaries..."
+rm -f /usr/local/bin/openclaw-agent /usr/local/bin/openclaw-orchestrator /usr/local/bin/openclaw-tracer
+
+echo "[openclaw] Removing config..."
+rm -rf /etc/openclaw
+
+echo "[openclaw] Data preserved in /var/lib/openclaw and /opt/openclaw"
+echo "[openclaw] Uninstalled. Run 'userdel openclaw' to remove the service user."
+UNINSTALL
+chmod +x "$INSTALL_DIR/uninstall.sh"
+info "Uninstall: $INSTALL_DIR/uninstall.sh"
+
+# ═══════════════════════════════════════════════════════════════════
+# 9. Start services
 # ═══════════════════════════════════════════════════════════════════
 
 banner "Starting services"
 
+start_svc() { systemctl start "openclaw-$1" && info "openclaw-$1 ● active"; }
+
 case "$ROLE" in
-    agent)
-        systemctl start openclaw-agent
-        log "openclaw-agent started"
-        ;;
-    orchestrator)
-        systemctl start openclaw-orchestrator
-        log "openclaw-orchestrator started"
-        ;;
-    tracer)
-        systemctl start openclaw-tracer
-        log "openclaw-tracer started"
-        ;;
-    infra)
-        log "Infrastructure services (Redis + PostgreSQL) are running"
-        ;;
-    all)
-        systemctl start openclaw-agent
-        systemctl start openclaw-orchestrator
-        systemctl start openclaw-tracer
-        log "All services started"
-        ;;
+    agent)        start_svc agent ;;
+    orchestrator) start_svc orchestrator ;;
+    tracer)       start_svc tracer ;;
+    infra)        info "Infrastructure services already running" ;;
+    all)          start_svc agent; start_svc orchestrator; start_svc tracer ;;
 esac
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 9: Summary
+# 10. Summary
 # ═══════════════════════════════════════════════════════════════════
 
-banner "Installation complete"
+banner "✓ Installation complete"
 
-cat <<EOF
+cat <<SUMMARY
 
-  Role:           $ROLE
-  Agent ID:       $AGENT_ID
-  Cloud:          $CLOUD_PROVIDER ($CLOUD_REGION)
-  Endpoint:       $AGENT_ENDPOINT
-  Redis:          $REDIS_URL
-  Config:         $CONFIG_DIR/openclaw.env
-  Logs:           journalctl -u openclaw-${ROLE} -f
+  ${B}Role:${N}        $ROLE
+  ${B}Agent ID:${N}    $AGENT_ID
+  ${B}Cloud:${N}       $CLOUD / $REGION
+  ${B}Endpoint:${N}    $AGENT_ENDPOINT
 
-EOF
+SUMMARY
 
-if [[ "$ROLE" == "agent" || "$ROLE" == "all" ]]; then
-cat <<EOF
+[[ "$ROLE" == "agent" || "$ROLE" == "all" ]] && cat <<AGENT
   ── Agent Sidecar ──
-  Sidecar:        http://${ENDPOINT_IP}:${SIDECAR_PORT}
-  Core proxy:     $OPENCLAW_CORE_URL
-  Telegram hook:  POST ${AGENT_ENDPOINT}/webhook/telegram
-  Webchat:        POST ${AGENT_ENDPOINT}/webchat/message
-  A2A:            POST ${AGENT_ENDPOINT}/a2a/messages
-  Health:         GET  ${AGENT_ENDPOINT}/health
+  Health:      GET  ${AGENT_ENDPOINT}/health
+  Telegram:    POST ${AGENT_ENDPOINT}/webhook/telegram
+  Webchat:     POST ${AGENT_ENDPOINT}/webchat/message
+  A2A:         POST ${AGENT_ENDPOINT}/a2a/messages
+  Set webhook: curl -X POST "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/setWebhook?url=${AGENT_ENDPOINT}/webhook/telegram"
 
-EOF
-fi
+AGENT
 
-if [[ "$ROLE" == "orchestrator" || "$ROLE" == "all" ]]; then
-cat <<EOF
+[[ "$ROLE" == "orchestrator" || "$ROLE" == "all" ]] && cat <<ORCH
   ── Orchestrator ──
-  Watch agent:    clawmacdo watch --agent $AGENT_ID --channel telegram
-  List roster:    redis-cli SMEMBERS openclaw:agent:roster
-  Agent meta:     redis-cli HGETALL openclaw:agent:${AGENT_ID}:meta
+  Watch:       clawmacdo watch --agent ${AGENT_ID} --channel telegram
+  Fleet:       clawmacdo fleet status
+  Roster:      redis-cli SMEMBERS openclaw:agent:roster
+  Agent meta:  redis-cli HGETALL openclaw:agent:${AGENT_ID}:meta
 
-EOF
-fi
+ORCH
 
-if [[ "$ROLE" == "tracer" || "$ROLE" == "all" ]]; then
-cat <<EOF
+[[ "$ROLE" == "tracer" || "$ROLE" == "all" ]] && cat <<TRACER
   ── Tracer ──
-  Database:       $DATABASE_URL
-  Query traces:   psql "$DATABASE_URL" -c "SELECT * FROM message_trace ORDER BY recorded_at DESC LIMIT 10;"
+  DB:          ${DATABASE_URL}
+  Query:       psql "${DATABASE_URL}" -c "SELECT * FROM message_trace LIMIT 5;"
 
-EOF
-fi
+TRACER
 
-if [[ "$ROLE" == "agent" ]]; then
-cat <<EOF
-  ── Next steps ──
-  1. Set Telegram webhook:
-     curl -X POST "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/setWebhook?url=${AGENT_ENDPOINT}/webhook/telegram"
+cat <<COMMON
+  ── Common ──
+  Logs:        journalctl -u openclaw-${ROLE} -f
+  Config:      $CONFIG_DIR/openclaw.env
+  Uninstall:   $INSTALL_DIR/uninstall.sh
 
-  2. Verify registration:
-     redis-cli HGETALL openclaw:agent:${AGENT_ID}:meta
+COMMON
 
-  3. Watch logs:
-     journalctl -u openclaw-agent -f
-
-EOF
-fi
-
-log "Done! 🦀"
+info "Done 🦀"
