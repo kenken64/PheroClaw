@@ -22,6 +22,10 @@ pub fn consumer_group(agent_id: &str) -> String {
     format!("cg-{agent_id}")
 }
 
+// --- ACL ---
+pub const P2P_RULES_KEY: &str = "openclaw:acl:p2p-rules";
+pub const ACL_STANCE_KEY: &str = "openclaw:acl:default-stance";
+
 // --- Agent discovery metadata ---
 
 pub fn agent_meta(agent_id: &str) -> String {
