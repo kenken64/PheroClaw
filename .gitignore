@@ -21,3 +21,6 @@ Thumbs.db
 
 # SQLx offline mode
 .sqlx/
+
+# Deploy keys (API keys for remote agents)
+.deploy-keys
